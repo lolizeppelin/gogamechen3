@@ -1,0 +1,756 @@
+#!/usr/bin/python
+# -*- encoding: utf-8 -*-
+import six
+import logging
+import time
+import sys
+import eventlet
+import base64
+
+from simpleutil.config import cfg
+from simpleutil.config import types
+from simpleutil.utils import table
+from simpleutil.utils import timeutils
+from simpleutil.utils import argutils
+
+from goperation.manager import common as manager_common
+from goperation.api.client.config import client_opts
+from goperation.api.client.config import index_opts
+from goperation.api.client.config import zone_opt
+from goperation.api.client import ManagerClient
+
+from goperation.api.client.utils import prepare_results
+from goperation.api.client.utils import wait_finish
+from goperation.api.client.utils import p_asyncrequest
+
+from gogamechen3 import common
+from gogamechen3.api.client import Gogamechen3DBClient
+
+CONF = cfg.CONF
+
+timeout_opt = cfg.IntOpt('timeout',
+                         default=30,
+                         help='Send file/Upgrade/Uploade/Reset request timeout')
+
+entity_opt = cfg.IntOpt('entity',
+                        short='e',
+                        required=True,
+                        help='Target objtype entity')
+
+group_opt = cfg.IntOpt('group_id', required=True,
+                       short='g', help='objtype game group')
+
+objtype_opt = cfg.StrOpt('objtype',
+                         required=True,
+                         short='o', choices=[common.GAMESERVER, common.GMSERVER, common.CROSSSERVER],
+                         default='gamesvr',
+                         help='Game objtype objfile for')
+
+subtype_opt = cfg.StrOpt('subtype',
+                         required=True,
+                         short='s',
+                         choices=[common.DATADB, common.LOGDB, common.APPFILE],
+                         help='Game subtype objfile for')
+
+agent_opt = cfg.IntOpt('agent',
+                       short='a',
+                       min=1,
+                       help='Game install agent, if not set, auto select'
+                       )
+
+appfile_opt = cfg.StrOpt(common.APPFILE,
+                         required=True,
+                         help='Game appfile file md5')
+
+upgraed_opts = [
+    cfg.StrOpt(common.DATADB,
+               help='Game datadb upgraed file md5'),
+    cfg.StrOpt(common.LOGDB,
+               help='Game logdb upgraed file md5'),
+    cfg.StrOpt('backup',
+               choices=[common.DATADB, common.LOGDB, common.APPFILE],
+               help='Backup when upgrade')
+]
+
+
+opentime_opt = cfg.IntOpt('opentime',
+                          required=True,
+                          default=int(time.time()),
+                          short='t',
+                          help='Game server opentime time, default is now')
+
+
+opentimes_opts = [
+    cfg.IntOpt('start',
+               required=True,
+               help='Show id start'),
+    cfg.IntOpt('end',
+               required=True,
+               help='Show id end'),
+    cfg.StrOpt('date',
+               short='d',
+               required=True,
+               help='opentime of date'),
+]
+
+
+datadb_opt = cfg.IntOpt('datadb',
+                        short='d',
+                        min=1,
+                        help='Game data database id')
+
+
+logdb_opt = cfg.IntOpt('logdb',
+                       short='l',
+                       min=1,
+                       help='Game log database id')
+
+cross_opt = cfg.IntOpt('cross',
+                       short='c',
+                       help='Game server cross id, if not set auto select')
+
+
+one_opts = [group_opt, objtype_opt, entity_opt]
+
+create_opts = [group_opt, objtype_opt,
+               agent_opt, zone_opt,
+               appfile_opt,
+               datadb_opt,
+               ]
+
+reset_opts = [
+    cfg.BoolOpt('databases',
+                short='d',
+                default=False,
+                help='Reset databases of entity, default not'),
+    cfg.BoolOpt('chiefs',
+                short='c',
+                default=False,
+                help='Reset chiefs of entity, default not, only for %s' % common.GAMESERVER),
+]
+
+migrate_opts = [
+    cfg.IntOpt('new',
+               short='n', min=1,
+               help='Migrate dest agent')
+]
+
+gamesvr_create_ext_opt = [logdb_opt, opentime_opt, cross_opt,
+                          cfg.ListOpt('include',
+                                      item_type=types.Integer(),
+                                      help="include packages"),
+                          cfg.ListOpt('exclude',
+                                      item_type=types.Integer(),
+                                      help="exclude packages"),
+                          cfg.StrOpt('areaname',
+                                     required=True,
+                                     help="Area name"),
+                          cfg.IntOpt('show_id',
+                                     required=True,
+                                     help='Area show id'
+                                     ),
+                          cfg.StrOpt('platform',
+                                     choices=[common.ANDROID, common.IOS, common.ANY],
+                                     required=True,
+                                     help='Entity platform type'
+                                     ),
+                          ]
+
+area_opt = cfg.IntOpt('area', help='Target area id')
+
+areas_opt = cfg.ListOpt('areas',
+                        required=True,
+                        item_type=types.String(regex=manager_common.ENABLEIDS),
+                        help='Target areas id list, value like 1-2,3,4,5, all means all')
+
+stop_opt = cfg.BoolOpt('kill',
+                       default=False,
+                       help='Stop process with kill options when call stop')
+
+version_opts = cfg.StrOpt('rversion',
+                          required=True,
+                          help='Cdn resource version')
+
+package_opt = cfg.IntOpt('package_id',
+                         short='p',
+                         required=True,
+                         help='Package id')
+
+delete_opt = cfg.BoolOpt('delete',
+                         default=False,
+                         help='Delete database when clean entity, if flase, just revmove quote')
+
+
+def maps(client, group_id):
+    code, result, data = prepare_results(client.group_maps, group_id)
+    if code:
+        print('\033[1;31;40m')
+        print 'Get areas map fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    _maps = {}
+    for kv in data:
+        _maps[kv.get('entity')] = kv.get('areas')
+    return _maps
+
+
+def invert(areamap):
+    _invert_maps = {}
+    for entity, areas in six.iteritems(areamap):
+        for area in areas:
+            _invert_maps[area] = entity
+    return _invert_maps
+
+
+def _objtype():
+    _opt = objtype_opt
+    prefixs = ['--%s' % _opt.name]
+    if _opt.short:
+        prefixs.append('-%s' % _opt.short)
+    choices = _opt.type.choices
+    index = 0
+    for i, arg in enumerate(sys.argv):
+        if arg in prefixs:
+            index = i + 1
+    if not index:
+        objtype = _opt.default
+    else:
+        objtype = sys.argv[index]
+    if choices and objtype not in choices:
+        raise ValueError('objtype value not in %s' % str(choices))
+    return objtype
+
+
+def client(session=None, timeout=None):
+    return Gogamechen3DBClient(httpclient=ManagerClient(url=CONF.gcenter, port=CONF.gcenter_port,
+                                                        retries=CONF.retries, timeout=timeout or CONF.apitimeout,
+                                                        token=CONF.trusted, session=session))
+
+
+def list():
+    CONF.register_cli_opts(index_opts)
+    CONF.register_cli_opt(group_opt)
+    CONF.register_cli_opt(objtype_opt)
+    CONF(project='cmd')
+    _client = client()
+    code, result, data = prepare_results(_client.appentitys_index, CONF.group_id, CONF.objtype)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    entity_heads = ['group', 'entity', 'areas', 'agent_id', 'status', 'objtype']
+    if CONF.objtype == common.GAMESERVER:
+        entity_heads.append('opentime')
+    print '\033[1;32;40m\r',
+    print 'List %s entitys success' % CONF.objtype
+    print 'status DELETED:-2  UNACTIVE:-1  ACTIVE:0',
+    print '\033[0m'
+    tb = table.PleasantTable(ident=0, columns=entity_heads, counter=True)
+    areas = None
+    for appentity in data:
+        entity = appentity.get('entity')
+        row = [appentity.get('group_id'), entity, appentity.get('areas'),
+               appentity.get('agent_id'),
+               appentity.get('status'), appentity.get('objtype')
+               ]
+        if CONF.objtype == common.GAMESERVER:
+            row.append(timeutils.unix_to_iso(appentity.get('opentime')))
+        tb.add_row(row)
+    print tb.pformat()
+
+
+def create():
+    objtype = _objtype()
+    CONF.register_cli_opts(create_opts)
+    if objtype == common.GAMESERVER:
+        CONF.register_cli_opts(gamesvr_create_ext_opt)
+
+    CONF(project='cmd')
+    _client = client()
+
+    databases = dict()
+    body = dict(appfile=CONF.appfile)
+
+    if CONF.agent:
+        body.setdefault('agent_id', CONF.agent)
+
+    if CONF.zone:
+        body.setdefault('zone', CONF.zone)
+
+    if CONF.datadb:
+        databases.setdefault('datadb', CONF.datadb)
+
+    if objtype == common.GAMESERVER:
+        body.setdefault('opentime', CONF.opentime)
+        body.setdefault('show_id', CONF.show_id)
+        body.setdefault('areaname', base64.decodestring(base64.urlsafe_b64decode(CONF.areaname)))
+        body.setdefault('platform', CONF.platform)
+        if CONF.include:
+            body.setdefault('include', CONF.include)
+        if CONF.exclude:
+            body.setdefault('exclude', CONF.exclude)
+        if CONF.cross:
+            body.setdefault('cross_id', CONF.cross)
+        if CONF.logdb:
+            databases.setdefault('logdb', CONF.logdb)
+
+    if databases:
+        body.setdefault('databases', databases)
+
+    code, result, data = prepare_results(_client.appentitys_create, CONF.group_id, CONF.objtype, body)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    print '\033[1;32;40m\r',
+    print 'Create %s entity success' % objtype
+    print '\033[0m'
+    appentity = data[0]
+    databases = appentity.get('databases')
+    print 'entity: %d' % appentity.get('entity')
+    print 'group id: %d' % CONF.group_id
+    print 'agent id: %d' % appentity.get('agent_id')
+    print 'objtype: %s' % appentity.get('objtype')
+    if objtype == common.GAMESERVER:
+        print 'cross id: %d' % appentity.get('cross_id')
+        print 'opentime: %s' % timeutils.unix_to_iso(CONF.opentime)
+        print 'area id: %d' % appentity.get('areas')[0]['area_id']
+        print 'area name: %s' % CONF.areaname
+    print '-------------database info-------------'
+    for subtype in databases:
+        database = databases[subtype]
+        print 'subtype: %s' % subtype
+        print 'host: %s' % database.get('host')
+        print 'port: %d' % database.get('port')
+        print 'schema: %s' % database.get('schema')
+        print 'user: %s' % database.get('user')
+        print 'passwd: %s' % database.get('passwd')
+        print 'ro_user: %s' % database.get('ro_user')
+        print 'ro_passwd: %s' % database.get('ro_passwd')
+        print 'character_set: %s' % database.get('character_set')
+        print 'database_id: %d' % database.get('database_id')
+        print 'quote_id: %d' % database.get('quote_id')
+        print '---------------------------------------'
+
+
+def show():
+    objtype = _objtype()
+    if objtype == common.GAMESERVER:
+        entity_opt.required = False
+        CONF.register_cli_opt(area_opt)
+    CONF.register_cli_opts(one_opts)
+    CONF(project='cmd')
+    _client = client()
+    target = CONF.entity
+    if objtype == common.GAMESERVER:
+        if CONF.area:
+            areamap = invert(maps(_client, CONF.group_id))
+            try:
+                target = areamap[CONF.area]
+            except KeyError:
+                print('\033[1;31;40m')
+                print 'area can not be found for %s' % common.GAMESERVER
+                print('\033[0m')
+                sys.exit(1)
+        elif not CONF.entity:
+            print('\033[1;31;40m')
+            print 'area or entity must be set for show %s' % common.GAMESERVER
+            print('\033[0m')
+            sys.exit(1)
+    code, result, data = prepare_results(_client.appentity_show, CONF.group_id, CONF.objtype, target)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    appentity = data[0]
+    metadata = appentity.get('metadata')
+    print '\033[1;32;40m\r',
+    print 'Show package success'
+    print 'status DELETED:-2  UNACTIVE:-1  ACTIVE:0',
+    print '\033[0m'
+    print 'status: %d' % appentity.get('status')
+    print 'group id: %s' % appentity.get('group_id')
+    print 'objtype: %s' % appentity.get('objtype')
+    print 'entity: %d' % appentity.get('entity')
+    print 'ports: %s' % ','.join(map(str, appentity.get('ports')))
+    print 'local_ip: %s' % metadata.get('local_ip') if metadata else 'offline'
+    print 'external_ips: %s' % str(metadata.get('external_ips')) if metadata else 'offline'
+    if appentity.get('objtype') == common.GAMESERVER:
+        print 'versions: %s' % str(appentity.get('versions'))
+        print '--------------areas  info--------------'
+        for area in appentity.get('areas'):
+            print 'area id: %d | areaname: %s' % (area['area_id'], area['areaname'])
+    print '-------------database info-------------'
+    for database in appentity.get('databases'):
+        print 'subtype: %s' % database.get('subtype')
+        print 'schema: %s' % database.get('schema')
+        print 'host: %s' % database.get('host')
+        print 'port: %d' % database.get('port')
+        print 'ro_user: %s' % database.get('ro_user')
+        print 'ro_passwd: %s' % database.get('ro_passwd')
+        print 'database id: %d' % database.get('database_id')
+        print 'quote id: %d' % database.get('quote_id')
+        print '---------------------------------------'
+
+
+def delete():
+    CONF.register_cli_opts(one_opts)
+    CONF(project='cmd')
+    _client = client()
+    if CONF.objtype == common.GAMESERVER:
+        areamap = maps(_client, CONF.group_id)
+    code, result, data = prepare_results(_client.appentity_delete, CONF.group_id, CONF.objtype, CONF.entity)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    appentity = data[0]
+    print('\033[1;32;40m')
+    print result
+    print('\033[0m')
+    entity = appentity.get('entity')
+    metadata = appentity.get('metadata')
+    print 'objtype: %s' % CONF.objtype
+    print 'entity: %d' % entity
+    if CONF.objtype == common.GAMESERVER:
+        if entity in areamap:
+            areas = ','.join(argutils.unmap(areamap[entity]))
+        else:
+            areas = None
+        print 'areas: %s' % areas
+    print 'ports: %s' % ','.join(map(str, appentity.get('ports')))
+    print 'local_ip: %s' % metadata.get('local_ip')
+    print 'external_ips: %s' % str(metadata.get('external_ips'))
+
+
+def clean():
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(delete_opt)
+    CONF(project='cmd')
+    _client = client()
+    code, result, data = prepare_results(_client.appentity_clean, CONF.group_id, CONF.objtype, CONF.entity,
+                                         CONF.delete)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    appentity = data[0]
+    print('\033[1;32;40m')
+    print 'Clean entity success'
+    print('\033[0m')
+    metadata = appentity.get('metadata')
+    print 'objtype: %s' % CONF.objtype
+    print 'entity: %d' % appentity.get('entity')
+    print 'ports: %s' % ','.join(map(str, appentity.get('ports')))
+    print 'local_ip: %s' % metadata.get('local_ip')
+    print 'external_ips: %s' % str(metadata.get('external_ips'))
+
+
+def reset():
+    appfile_opt.required = False
+    timeout_opt.default = 15
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(appfile_opt)
+    CONF.register_cli_opts(reset_opts)
+    CONF.register_cli_opt(timeout_opt)
+    CONF(project='cmd')
+    body = dict(databases=CONF.databases, appfile=CONF.appfile, chiefs=CONF.chiefs)
+    timeout = CONF.timeout
+    if CONF.appfile:
+        timeout = max(CONF.timeout, 40)
+    _client = client(timeout=timeout)
+    code, result, data = prepare_results(_client.appentity_reset, CONF.group_id, CONF.objtype, CONF.entity, body)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    print('\033[1;32;40m')
+    print 'Reset entity success'
+    print('\033[0m')
+    print 'objtype: %s' % CONF.objtype
+    print 'entity: %d' % CONF.entity
+
+
+def migrate():
+    appfile_opt.required = False
+    timeout_opt.default = 45
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(appfile_opt)
+    CONF.register_cli_opts(migrate_opts)
+    CONF.register_cli_opt(timeout_opt)
+    CONF(project='cmd')
+    body = dict(new=CONF.new, appfile=CONF.appfile)
+    timeout = CONF.timeout
+    if CONF.appfile:
+        timeout = min(CONF.timeout, 300)
+        timeout = max(timeout, 30)
+    _client = client(timeout=timeout)
+    code, result, data = prepare_results(_client.appentity_migrate, CONF.group_id, CONF.objtype, CONF.entity, body)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    print('\033[1;32;40m')
+    print 'Migrate entity success'
+    print('\033[0m')
+    print 'objtype: %s' % CONF.objtype
+    print 'entity: %d' % CONF.entity
+
+
+def vquote():
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(version_opts)
+    CONF.register_cli_opt(package_opt)
+    CONF(project='cmd')
+    _client = client()
+    code, result, data = prepare_results(_client.appentity_vquote, CONF.group_id, CONF.objtype, CONF.entity,
+                                         CONF.package_id, CONF.rversion)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    quote = data[0]
+    print('\033[1;32;40m')
+    print 'Quote resource version success'
+    print 'entity: %s' % CONF.entity
+    print 'version: %s' % CONF.rversion
+    print 'resource_id: %d' % quote.get('resource_id')
+    print 'quote_id: %d' % quote.get('quote_id')
+    print('\033[0m')
+
+
+def unvquote():
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(package_opt)
+    CONF(project='cmd')
+    _client = client()
+    code, result, data = prepare_results(_client.appentity_unvquote, CONF.group_id, CONF.objtype, CONF.entity,
+                                         CONF.package_id)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    quote = data[0]
+    print('\033[1;32;40m')
+    print 'Unquote resource version success'
+    print 'entity: %s' % CONF.entity
+    print 'version: %s' % quote.get('version')
+    print 'quote_id: %d' % quote.get('quote_id')
+    print('\033[0m')
+
+
+def async(action, ext_opt=None, ext_opts=None):
+    objtype = _objtype()
+    CONF.register_cli_opt(timeout_opt)
+    CONF.register_cli_opts(one_opts)
+    if objtype == common.GAMESERVER:
+        entity_opt.required = False
+        CONF.register_cli_opt(areas_opt)
+    if ext_opt:
+        CONF.register_cli_opt(ext_opt)
+    if ext_opts:
+        CONF.register_cli_opts(ext_opts)
+    CONF(project='cmd')
+    _client = client()
+    if objtype == common.GAMESERVER:
+        if CONF.entity:
+            print('\033[1;31;40m')
+            print 'Use --areas for %s' % common.GAMESERVER
+            print('\033[0m')
+            sys.exit(1)
+        th = eventlet.spawn(maps, _client, CONF.group_id)
+        if 'all' in CONF.areas:
+            target = 'all'
+        else:
+            areamap = th.wait()
+            invert_maps = invert(areamap)
+            areas = argutils.map_to_int(CONF.areas)
+            entitys = set()
+            for area in areas:
+                try:
+                    entitys.add(invert_maps[area])
+                except KeyError:
+                    raise ValueError('Area %d can not be found' % area)
+            target = ','.join(argutils.unmap(entitys))
+    else:
+        target = CONF.entity
+        entitys = [CONF.entity]
+
+    _func = getattr(_client, 'appentity_%s' % action)
+    if not _func:
+        raise AttributeError
+    timeout = CONF.timeout
+    if not timeout:
+        timeout = 30
+    now = int(time.time())
+    body = dict(request_time=now,
+                finishtime=now + timeout)
+
+    if action == 'stop':
+        if CONF.kill:
+            body.setdefault('kill', CONF.kill)
+
+    elif action == 'upgrade':
+        backup = CONF.backup or []
+        objfiles = dict()
+        for subtype in (common.APPFILE, common.LOGDB, common.DATADB):
+            if CONF[subtype]:
+                objfiles[subtype] = dict(md5=CONF[subtype], timeout=CONF.timeout)
+                if subtype in backup:
+                    objfiles[subtype]['backup'] = True
+        body.setdefault('objfiles', objfiles)
+
+    code, result, data = prepare_results(_func,
+                                         CONF.group_id, CONF.objtype, target, body=body)
+    asyncrequest = data[0]
+    request_id = asyncrequest.get('request_id')
+    sleep = asyncrequest.get('finishtime') - now
+    dead = asyncrequest.get('deadline') - now
+    print '%s %s request %s has been sended' % (objtype, action, request_id)
+    print 'Result will respon after %d, dead after %d' % (sleep, dead)
+    if CONF.objtype == common.GAMESERVER:
+        areamap = th.wait()
+        map_heads = ['entity', 'areas']
+        tb = table.PleasantTable(ident=0, columns=map_heads, counter=True)
+        for entity in sorted(areamap.keys()):
+            if target == 'all' or entity in entitys:
+                tb.add_row([entity, ','.join(argutils.unmap(areamap[entity]))])
+        print tb.pformat()
+    if not wait_finish(_client, asyncrequest):
+        print('\033[1;31;40m')
+        print 'Async request not finish after deadline'
+        print('\033[0m')
+        sys.exit(1)
+    p_asyncrequest(_client, request_id=request_id, details=True)
+
+
+def start():
+    async('start')
+
+
+def stop():
+    async('stop', stop_opt)
+
+
+def status():
+    async('status')
+
+
+def flushconfig():
+    async('flushconfig')
+
+
+def upgrade():
+    appfile_opt.required = False
+    async('upgrade', appfile_opt, upgraed_opts)
+
+
+def opentime():
+    CONF.register_cli_opts(one_opts)
+    CONF.register_cli_opt(opentime_opt)
+    CONF(project='cmd')
+    _client = client()
+    emap = maps(_client, CONF.group_id)
+    code, result, data = prepare_results(_client.game_opentime, CONF.group_id, CONF.entity,
+                                         CONF.opentime)
+    if code:
+        print('\033[1;31;40m')
+        print 'Fail, code %d, result %s' % (code, result)
+        if data:
+            print data
+        print('\033[0m')
+        sys.exit(1)
+    areas = emap[CONF.entity]
+    print('\033[1;32;40m')
+    print 'Change %s opentime success' % common.GAMESERVER
+    print 'entity: %s' % CONF.entity
+    print 'areas: %s' % ','.join(map(str, areas))
+    print('\033[0m')
+
+
+def opentimes():
+    CONF.register_cli_opt(group_opt)
+    CONF.register_cli_opts(opentimes_opts)
+    CONF(project='cmd')
+
+    show_ids = set([])
+    entitys = set()
+
+    import datetime
+    opentime = int(time.mktime(datetime.datetime.strptime(CONF.date, '%Y%m%d').timetuple()))
+
+    for index in range(CONF.start, CONF.end + 1):
+        show_ids.add(index)
+
+    _client = client()
+    emap = maps(_client, CONF.group_id)
+    for entity in emap:
+        areas = emap[entity]
+        for area in areas:
+            if area['show_id'] in show_ids:
+                entitys.add(entity)
+
+    for entity in entitys:
+        code, result, data = prepare_results(_client.game_opentime, CONF.group_id,
+                                             entity, opentime)
+        if code:
+            print('\033[1;31;40m')
+            print 'Fail, code %d, result %s' % (code, result)
+            print('\033[0m')
+            sys.exit(1)
+        print 'Change opentime for entity %d success' % entity
+
+    print('\033[1;31;40m')
+    print 'All appentity chaange opentime success'
+    print('\033[0m')
+
+
+def main():
+    FUNCS = ['list', 'create', 'show', 'delete',
+             'start', 'stop', 'status', 'flushconfig', 'upgrade',
+             'vquote', 'unvquote', 'clean', 'opentime', 'reset', 'migrate', 'opentimes']
+    try:
+        func = sys.argv.pop(1)
+        if func not in FUNCS:
+            raise ValueError
+    except (IndexError, ValueError):
+        print 'action is: %s' % '  '.join(FUNCS)
+        print 'use -h for help'
+        sys.exit(1)
+    func = eval(func)
+    logging.basicConfig(level=logging.WARN)
+    CONF.register_cli_opts(client_opts)
+    func()
+
+
+if __name__ == '__main__':
+    main()
